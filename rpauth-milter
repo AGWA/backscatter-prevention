@@ -1,0 +1,147 @@
+#!/usr/bin/env python
+
+#
+# Copyright (C) 2018 Andrew Ayer
+#
+# Permission is hereby granted, free of charge, to any person obtaining a
+# copy of this software and associated documentation files (the "Software"),
+# to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Software, and to permit persons to whom the
+# Software is furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included
+# in all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+# OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+# ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+# OTHER DEALINGS IN THE SOFTWARE.
+#
+# Except as contained in this notice, the name(s) of the above copyright
+# holders shall not be used in advertising or otherwise to promote the
+# sale, use or other dealings in this Software without prior written
+# authorization.
+#
+
+from __future__ import print_function
+
+import Milter
+import dkim
+import spf
+import StringIO
+import syslog
+import sys
+import socket
+from Milter.utils import parse_addr
+
+syslog.openlog('rpauth-milter', 0, syslog.LOG_MAIL)
+
+class rpauthMilter(Milter.Base):
+	def log(self, *msg):
+		syslog.syslog('[%d] %s' % (self.id, ' '.join([str(m) for m in msg])))
+
+	def __init__(self):
+		self.id = Milter.uniqueID()
+
+	@Milter.noreply
+	def connect(self, hostname, family, hostaddr):
+		if family == socket.AF_INET or family == socket.AF_INET6:
+			self.sender_ipaddr = hostaddr[0]
+		else:
+			self.sender_ipaddr = None
+		return Milter.CONTINUE
+
+	@Milter.noreply
+	def envfrom(self, mail_from, *str):
+		self.mail_from = mail_from
+		addr = parse_addr(self.mail_from)
+		self.from_user = addr[0].lower()
+		if len(addr) == 2:
+			self.from_domain = addr[1].lower()
+		else:
+			self.log('No mail from domain; assuming localhost')
+			self.from_domain = 'localhost'
+		self.rcpt_to = []
+		self.buf = StringIO.StringIO()
+		return Milter.CONTINUE
+
+	@Milter.noreply
+	def envrcpt(self, rcpt, *str):
+		self.rcpt_to.append(rcpt)
+		return Milter.CONTINUE
+
+	@Milter.noreply
+	def header(self, name, val):
+		self.buf.write("%s: %s\n" % (name, val))
+		return Milter.CONTINUE
+
+	@Milter.noreply
+	def eoh(self):
+		self.buf.write("\n")
+		return Milter.CONTINUE
+
+	@Milter.noreply
+	def body(self,chunk):
+		self.buf.write(chunk)
+		return Milter.CONTINUE
+
+	def check_spf(self):
+		if self.sender_ipaddr is None:
+			self.log('Cannot verify SPF because there is no sender IP address')
+			return False
+		q = spf.query(self.sender_ipaddr, self.from_domain, None)
+		res, code, txt = q.check()
+		self.log('SPF for %s from %s is %s' % (self.from_domain, self.sender_ipaddr, res))
+		return res == 'pass'
+
+	def check_dkim(self):
+		self.buf.seek(0)
+		buf = self.buf.read()
+		d = dkim.DKIM(buf)
+		try:
+			if not d.verify():
+				self.log('DKIM is invalid')
+				return False
+		except dkim.DKIMException as x:
+			self.log('DKIM exception: %s' % x)
+			return False
+		except Exception as x:
+			self.log('Exception while checking DKIM: %s' % x)
+			return False
+
+		dkim_identity = d.signature_fields.get(b'i')
+		if dkim_identity is None:
+			dkim_identity = "@" + d.signature_fields.get(b'd')
+		dkim_identity = dkim_identity.lower()
+
+		self.log('DKIM: identity=%s; user=%s; domain=%s' % (dkim_identity, self.from_user, self.from_domain))
+		return dkim_identity == '@' + self.from_domain or dkim_identity == self.from_user + '@' + self.from_domain
+
+	def disable_bounces(self):
+		for rcpt in self.rcpt_to:
+			self.log('Disabling bounces for %s to %s' % (rcpt, self.mail_from))
+			self.delrcpt(rcpt)
+			self.addrcpt(rcpt, 'NOTIFY=NEVER')
+
+	def eom(self):
+		if not(self.check_spf() or self.check_dkim()):
+			 self.disable_bounces()
+		return Milter.CONTINUE
+
+def main(argv):
+	if len(argv) != 2:
+		print('Usage: rpauth-milter socketname', file=sys.stderr)
+		return 2
+	socketname = argv[1]
+	Milter.factory = rpauthMilter
+	Milter.set_flags(Milter.ADDRCPT + Milter.ADDRCPT_PAR + Milter.DELRCPT)
+	Milter.set_exception_policy(Milter.CONTINUE)
+	Milter.runmilter('rpauth-milter', socketname, 120)
+	return 0
+
+if __name__ == '__main__':
+	sys.exit(main(sys.argv))
