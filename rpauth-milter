@@ -89,7 +89,7 @@ class rpauthMilter(Milter.Base):
 		self.buf.write(chunk)
 		return Milter.CONTINUE
 
-	def check_spf(self):
+	def has_valid_spf(self):
 		if self.sender_ipaddr is None:
 			self.log('Cannot verify SPF because there is no sender IP address')
 			return False
@@ -98,7 +98,7 @@ class rpauthMilter(Milter.Base):
 		self.log('SPF for %s from %s is %s' % (self.from_domain, self.sender_ipaddr, res))
 		return res == 'pass'
 
-	def check_dkim(self):
+	def has_valid_dkim(self):
 		self.buf.seek(0)
 		buf = self.buf.read()
 		d = dkim.DKIM(buf)
@@ -128,7 +128,7 @@ class rpauthMilter(Milter.Base):
 			self.addrcpt(rcpt, 'NOTIFY=NEVER')
 
 	def eom(self):
-		if not(self.check_spf() or self.check_dkim()):
+		if not(self.has_valid_spf() or self.has_valid_dkim()):
 			 self.disable_bounces()
 		return Milter.CONTINUE
 
